@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+results/
+results_*/
+*.npz
+*.msgpack
+.vscode/
+.DS_Store

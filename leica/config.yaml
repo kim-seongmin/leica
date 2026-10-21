@@ -1,0 +1,62 @@
+# LEICA on SMAX with exogenous opponent regimes (default: 5m_vs_6m, medium regime split).
+# Every key can be overridden from the command line: python train.py KEY=VALUE ...
+
+# experiment
+SEED: 1
+NUM_SEEDS: 1            # number of seeds trained in parallel (vmapped)
+SAVE_PATH: ./results    # where metrics and parameters are written (null: do not save)
+
+# environment
+ENV_NAME: HeuristicEnemySMAX
+ALG_NAME: LEICA
+MAP_NAME: 5m_vs_6m
+ENV_KWARGS:
+  see_enemy_actions: true
+  walls_cause_death: false
+  world_steps_per_env_step: 8
+TASK: MEDIUM
+# opponent regimes = indices into HeuristicEnemySMAX.tasks; paper tokens [shoot][attack][persist][move][target][dist]
+TRAINING_SET: [7, 44, 48, 78, 73, 92, 110, 112, 147, 313]   # TCTCR6 TCFAR8 TCFRW4 TWTRR4 TWTRC6 TWFAC8 TRTCC8 TRTCW6 TRFAW4 FXXAR6
+TEST_SET: [0, 13, 59, 64, 135]                               # TCTCC4 TCTAW6 TWTCW8 TWTAC6 TRFCC4 (held out)
+
+# training (MAPPO backbone)
+TOTAL_TIMESTEPS: 10000000
+NUM_ENVS: 128
+NUM_STEPS: 32
+NUM_EPOCHS: 4
+LR: 0.002
+LR_LINEAR_DECAY: true
+MAX_GRAD_NORM: 1.0
+CLIP_EPS: 0.2
+ENT_COEF: 0
+VF_COEF: 0.5
+GAMMA: 0.99
+GAE_LAMBDA: 0.95
+HIDDEN_SIZE: 128
+REW_SCALE: 10.0
+
+# context inference and one-step predictors
+Z_DIM: 32               # dimension of each latent context (direct context z, regime context y)
+Z_SAMPLES: 8            # transitions sampled per context from the same episode (K)
+A_RECON: 1000           # reconstruction coefficient
+A_KL: 0.5               # KL coefficient (filtered prior)
+
+# influence reward
+REWARD_WEIGHT: 0.03      # weight of the intrinsic (influence) reward
+ALPHA: 0.5              # constant mixing of mediated-influence (alpha) and value-sensitivity (1 - alpha) scores when ALPHA_OPTION is null
+ALPHA_OPTION: exp       # "exp": alpha(x) = exp(-10 x/X) over the X updates (paper); "linear": 1 - x/X; null: constant ALPHA
+W_TAU: 0.5              # softmax temperature of the influence weights
+EMA_RATE: 0.2           # EMA rate of the influence weights
+
+# partition of the world state into S^d / S^r
+PARTITION: auto         # "auto": automatic action-sensitivity partition (default); "manual": domain-informed SMAX split of the paper
+PARTITION_SCORE: cf     # "cf": action-sensitivity under counterfactual action perturbations (paper); "gain": predictive gain
+PARTITION_WARMUP_FRAC: 0.1   # the partition is estimated at the end of this fraction of training and then fixed
+STATS_FRAC: 0.02        # fraction of training used for the state normalisation statistics
+CHI_SAMPLES: 256        # states sampled for the counterfactual perturbation score
+
+# evaluation (greedy, all training and test regimes)
+TEST_DURING_TRAINING: true
+TEST_INTERVAL: 0.05     # as a fraction of the updates
+TEST_NUM_STEPS: 256
+TEST_NUM_ENVS: 256
