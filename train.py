@@ -65,8 +65,8 @@ def main():
     D = np.asarray(train_state.D)
     w = np.asarray(train_state.w_ex)
     chi = np.asarray(train_state.chi)
-    seen = metrics["test/seen/won"][:, -1]
-    unseen = metrics["test/unseen/won"][:, -1]
+    seen = np.asarray(outs["final_test"]["seen"]["returned_won_episode"])
+    unseen = np.asarray(outs["final_test"]["unseen"]["returned_won_episode"])
     for k in range(config["NUM_SEEDS"]):
         direct = [nm for nm, m in zip(train.coord_names, D[k]) if m]
         print(f"seed {k}: final greedy win rate seen {seen[k]:.3f} unseen {unseen[k]:.3f}; "
