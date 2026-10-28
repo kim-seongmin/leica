@@ -309,19 +309,33 @@ def make_train(config):
                 return sums.sum(0), cnts.sum()
 
             sums, cnts = jax.vmap(per_sample)(st, act, av)
-            cf = sums.sum(0) / jnp.maximum(cnts.sum(), 1)  # in units of the one-step-change std
-            cf = cf * ds_std / s_std[dyn_idx]  # -> normalised by the coordinate std (paper)
-            score = cf if config["PARTITION_SCORE"] == "cf" else gain
-            return score, two_means_split(score)
+            valid_coord = cm[t_i, e_i]
+            cf_num = (sums * valid_coord).sum(0)
+            cf_den = (cnts[:, None] * valid_coord).sum(0)
+            cf = cf_num / jnp.maximum(cf_den, 1)
+            cf = cf * ds_std / s_std[dyn_idx]
 
-        def print_partition(at, n, D, score):
+        def print_partition(at, accepted, n, D, score):
             if not bool(np.asarray(at).reshape(-1)[0]):
+                return
+            update = int(np.asarray(n).reshape(-1)[0])
+            if not bool(np.asarray(accepted).reshape(-1)[0]):
+                print(
+                    f"[update {update}] automatic partition unavailable; "
+                    "intrinsic shaping remains disabled.",
+                    flush=True,
+                )
                 return
             names = [nm for nm, m in zip(coord_names, np.asarray(D).reshape(-1)) if m]
             sc = np.asarray(score).reshape(-1)
-            print(f"[update {int(np.asarray(n).reshape(-1)[0])}] automatic partition: {len(names)}/{d} coordinates in S^d: "
-                  + ", ".join(names))
-            print("  scores: " + ", ".join(f"{nm}={s:.3g}" for nm, s in zip(coord_names, sc)), flush=True)
+            print(
+                f"[update {update}] automatic partition: {len(names)}/{d} "
+                "coordinates in S^d: " + ", ".join(names)
+            )
+            print(
+                "  scores: " + ", ".join(f"{nm}={s:.3g}" for nm, s in zip(coord_names, sc)),
+                flush=True,
+            )
 
         def _update_step(runner_state, unused):
             train_state, env_state, test_state, last_obs, last_rewards, last_dones, hstates, rng = runner_state
@@ -498,14 +512,13 @@ def make_train(config):
                         ext_loss = ext_loss.mean(0).reshape(N, E).mean(0)
 
                         def elbo(mu, std, r_loss):
-                            std = jnp.exp(jnp.log(std) * ~traj_batch.global_done[..., None])
-                            mu = mu * ~traj_batch.global_done[..., None]
-
+                            reset = traj_batch.global_done[:-1, ..., None]
+                            prior_mu = jnp.where(reset, jnp.zeros_like(mu[:-1]), mu[:-1])
+                            prior_std = jnp.where(reset, jnp.ones_like(std[:-1]), std[:-1])
                             q = distrax.MultivariateNormalDiag(mu[1:], std[1:])
-                            prior = distrax.MultivariateNormalDiag(mu[:-1], std[:-1])
+                            prior = distrax.MultivariateNormalDiag(prior_mu, prior_std)
                             kl_loss = config["A_KL"] * q.kl_divergence(prior)
                             kl_loss = kl_loss.mean(0).reshape(N, E).mean(0)
-
                             return (r_loss + kl_loss).mean()
 
                         elbo_loss = elbo(z_ext_mu, z_ext_std, ext_loss) + elbo(z_int_mu, z_int_std, int_loss)
@@ -597,8 +610,24 @@ def make_train(config):
                     return jax.jacrev(f)(s)  # [d_out, S]
 
                 def make_g(state):
-                    _, g = critic.apply(train_state.params["critic"], init_hstates[2], jax.lax.stop_gradient(z), state, traj_batch.dones)
-                    return g.sum()
+                    z_fixed = jax.lax.stop_gradient(z)
+                    h0 = jax.lax.stop_gradient(init_hstates[2])
+
+                    def step(h, inputs):
+                        s_t, z_t, done_t = inputs
+                        h_next, v_t = critic.apply(
+                            train_state.params["critic"],
+                            h,
+                            z_t[None, ...],
+                            s_t[None, ...],
+                            done_t[None, ...],
+                        )
+                        return jax.lax.stop_gradient(h_next), v_t[0]
+
+                    _, values = jax.lax.scan(
+                        step, h0, (state, z_fixed, traj_batch.dones)
+                    )
+                    return values.sum()
 
                 kappa = config["ALPHA"]
                 if config["ALPHA_OPTION"] == "exp":
@@ -626,7 +655,11 @@ def make_train(config):
                     s = jnp.sqrt((((c - m) ** 2) * Dm).sum() / jnp.maximum(Dm.sum(), 1))
                     return (c - m) / (s + 1e-8)
 
-                c = kappa * zstd(J_x.mean(axis=(0, 1))) + (1 - kappa) * zstd(J_v.mean(axis=(0, 1)))
+                valid = (~traj_batch.global_done[:-1]).astype(J_x.dtype)[..., None]
+                denom = jnp.maximum(valid.sum(axis=(0, 1)), 1.0)
+                cx_mean = jnp.where(valid > 0, J_x, 0.0).sum(axis=(0, 1)) / denom
+                cv_mean = jnp.where(valid > 0, J_v, 0.0).sum(axis=(0, 1)) / denom
+                c = kappa * zstd(cx_mean) + (1 - kappa) * zstd(cv_mean)
 
                 w_new = jax.lax.stop_gradient(jax.nn.softmax(jnp.where(Dm > 0, c / config["W_TAU"], -1e9)))
                 w_ema = (1 - config["EMA_RATE"]) * train_state.w_ex + config["EMA_RATE"] * w_new
@@ -648,13 +681,27 @@ def make_train(config):
                 lambda: estimate_partition(train_state, *part_batch, rng_p),
                 lambda: (jnp.zeros((d,)), jnp.ones((d,), dtype=bool)),
             )
-            train_state = train_state.replace(
-                D=jnp.where(at, D_new, train_state.D),
-                chi=jnp.where(at, score, train_state.chi),
-                part_ready=train_state.part_ready | at,
-                w_ex=jnp.where(at, D_new / jnp.maximum(D_new.sum(), 1), train_state.w_ex),
+            partition_ok = (
+                jnp.all(jnp.isfinite(score))
+                & (jnp.max(score) > jnp.min(score))
+                & jnp.any(D_new)
+                & jnp.any(~D_new)
             )
-            jax.debug.callback(print_partition, at, train_state.n_updates, train_state.D, train_state.chi)
+            accepted = at & partition_ok
+            train_state = train_state.replace(
+                D=jnp.where(accepted, D_new, train_state.D),
+                chi=jnp.where(at, score, train_state.chi),
+                part_ready=train_state.part_ready | accepted,
+                w_ex=jnp.where(
+                    accepted,
+                    D_new / jnp.maximum(D_new.sum(), 1),
+                    train_state.w_ex,
+                ),
+            )
+            jax.debug.callback(
+                print_partition, at, accepted,
+                train_state.n_updates, train_state.D, train_state.chi,
+            )
             update_state = (train_state, *update_state[1:-1], rng)
             update_state = _update_w(update_state)
             train_state = update_state[0]
@@ -756,8 +803,10 @@ def make_train(config):
         hstates = (init_hs_encoder, init_hs_actor, init_hs_critic)
         runner_state = (train_state, env_state, test_state, last_obs, last_reward, last_done, hstates, rng)
         runner_state, metrics = jax.lax.scan(_update_step, runner_state, None, NUM_UPDATES)
-
-        return {"runner_state": runner_state, "metrics": metrics}
+        rng, eval_rng = jax.random.split(runner_state[-1])
+        final_test = get_greedy_metrics(eval_rng, runner_state[0])
+        runner_state = (*runner_state[:-1], rng)
+        return {"runner_state": runner_state, "metrics": metrics, "final_test": final_test}
 
     train.coord_names = coord_names
     train.n_part = n_part
